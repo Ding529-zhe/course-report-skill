@@ -39,7 +39,7 @@ $repo = Split-Path -Parent $PSScriptRoot
 if ($Source -eq '') {
     $Source = Join-Path $env:USERPROFILE ".workbuddy\skills\$SkillName"
 }
-$dest = Join-Path $repo "skills\$SkillName"
+$dest = Join-Path $repo $SkillName
 
 if (-not (Test-Path -LiteralPath $Source)) {
     throw "源目录不存在：$Source"

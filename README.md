@@ -7,19 +7,20 @@
 ## 内容
 
 ```
-skills/
-└── course-report-docx/
-    ├── SKILL.md                  技能说明与工作流程
-    ├── references/
-    │   ├── format-spec.md        完整格式规范（20 节，凡涉及具体数值以它为准）
-    │   └── writing-guide.md      章节骨架与写作要求
-    ├── assets/
-    │   └── course-report-template.docx   主模板（含固化封面、内嵌字体、5 个分节）
-    └── scripts/
-        ├── prepare_report.py     从模板生成"干净起点"
-        ├── check_report.py       XML 级格式自检
-        └── render_check.ps1      渲染级自检（可选，需 Word）
+course-report-docx/
+├── SKILL.md                  技能说明与工作流程
+├── references/
+│   ├── format-spec.md        完整格式规范（20 节，凡涉及具体数值以它为准）
+│   └── writing-guide.md      章节骨架与写作要求
+├── assets/
+│   └── course-report-template.docx   主模板（含固化封面、内嵌字体、5 个分节）
+└── scripts/
+    ├── prepare_report.py     从模板生成"干净起点"
+    ├── check_report.py       XML 级格式自检
+    └── render_check.ps1      渲染级自检（可选，需 Word）
 ```
+
+> 技能直接放在**仓库根目录**，`tools/` 与文档同级。CC Switch 扫描的是仓库根下的一级目录（`<repo>/<技能名>/SKILL.md`），放在 `skills/` 之类子目录里会扫不到。
 
 ## 安装
 
@@ -29,16 +30,16 @@ skills/
 
 | 字段 | 值 |
 |---|---|
-| Owner | 你的 GitHub 用户名 |
+| Owner | `Ding529-zhe` |
 | Name | `course-report-skill` |
 | Branch | `main` |
-| Subdirectory | `skills` |
+| Subdirectory | 留空 |
 
 添加后点「刷新」，技能卡片出现，点「安装」。
 
 ### 方式二：手动复制
 
-把 `skills/course-report-docx/` 整个目录复制到目标应用的 skills 目录，例如：
+把仓库里的 `course-report-docx/` 整个目录复制到目标应用的 skills 目录，例如：
 
 - Claude Code：`~/.claude/skills/`
 - Codex：`~/.codex/skills/`
