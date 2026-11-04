@@ -4,7 +4,7 @@
 
 .DESCRIPTION
     日常只在 ~/.workbuddy/skills/<skill> 里改技能，改完跑这个脚本，
-    仓库里的 skills/<skill> 会被镜像成一致的内容，然后提交并推送。
+    仓库根目录的 <skill>/ 会被镜像成一致的内容，然后提交并推送。
     推上去之后 CC Switch 点「刷新」就能看到更新。
 
 .PARAMETER SkillName
