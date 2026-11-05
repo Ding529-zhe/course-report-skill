@@ -6,3 +6,7 @@ desktop.ini
 *.tmp
 *.bak
 *.swp
+
+# Python 字节码：py_compile / import 会产生，不能进仓库
+__pycache__/
+*.py[cod]
