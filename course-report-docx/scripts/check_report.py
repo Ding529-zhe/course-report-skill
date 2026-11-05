@@ -18,6 +18,7 @@
 
 import sys
 import os
+import re
 import zipfile
 import xml.etree.ElementTree as ET
 
@@ -37,13 +38,50 @@ FIRST_LINE_TWIP = (420, 480)                    # 2 字符缩进的固定值写�
 TBL_BORDER_SZ = 4                               # 表格边框 4/8 磅 = 0.5 磅
 HDR_BORDER_SZ = 6                               # 页眉下框线 6/8 磅 = 0.75 磅
 EXPECTED_SECTIONS = 5                           # 封面 / 摘要 / 目录 / 正文 / 末节
-CAPTION_STYLE = '5'                             # "题注"样式 styleId
-HEADING_STYLES = {'2': '标题1', '3': '标题2', '4': '标题3'}
 PLACEHOLDERS = ['XXXXXXX课程报告', '20XX级', 'XXXXXXXXXXXX', 'XXXXXX',
                 '{{REPORT_TITLE}}', '{{DATE}}']
 RED = {'ff0000'}
 CAPTION_SEQS = {'SEQ 图': '图', 'SEQ 表': '表', 'SEQ 代码': '算法'}
 MIN_BODY_LEN = 20                               # 取样正文段落的长度下限
+TOL_IND = 20                                    # 缩进容差（约 1pt，覆盖按字号换算的取整差）
+
+# ---------------------------------------------------------------- 样式名（不硬编码 styleId）
+# styleId 由 Word 按模板与界面语言自行分配。同一份规范在别的机器上可能是
+# 2/3/4、1/2/3、Heading1/2/3，甚至 000002 / 6qc6ic 这样的十六进制串。
+# 所以一律用 w:name（内置名，不随语言变）找样式，用 outlineLvl 判层级。
+CAPTION_STYLE_NAME = 'caption'
+
+# ---------------------------------------------------------------- 标题
+HEADING_LEVELS = (0, 1, 2)
+HEADING_NAMES = {0: '标题1', 1: '标题2', 2: '标题3'}
+THEME_FONTS = {'majorEastAsia', 'minorEastAsia', 'majorHAnsi', 'minorHAnsi',
+               'majorBidi', 'minorBidi'}
+
+# 期望值取自"排版后的实际效果"，不是 styles.xml 里的定义值——本模板的
+# heading 1 定义 sz=24，实际却排成 16pt；heading 2 定义 sz=32，实际 14pt。
+# 断言若读样式定义，会对着错误的数字判 PASS。
+HEADING_SPEC = {
+    0: {'sz': 32, 'font': '黑体', 'jc': 'center', 'pbb': True,
+        'ind_left': 643, 'ind_hanging': 643, 'hanging_chars': 200},
+    1: {'sz': 28, 'font': '黑体', 'jc': None, 'pbb': False,
+        'ind_left': 1124, 'ind_hanging': 1124, 'hanging_chars': 400},
+    2: {'sz': 24, 'font': '黑体', 'jc': None, 'pbb': False,
+        'ind_left': 964, 'ind_hanging': 964, 'hanging_chars': 400},
+}
+# 无编号一级标题（参考文献/致谢/附录）：不参与自动编号，字号允许 16pt 或 18pt
+UNNUMBERED_HEADING_SZ = (32, 36)
+
+# ---------------------------------------------------------------- 多级列表
+# 编号层的缩进必须留空：缩进由段落 ind 控制，两处都设会叠加成双倍。
+NUMBERING_EXPECT = {0: '第%1章', 1: '%1.%2', 2: '%1.%2.%3'}
+
+# ---------------------------------------------------------------- 目录
+TOC_ENTRY_SZ = 24                               # 目录条目小四 12pt
+TOC_RIGHT_TAB = {1: 8302, 2: 8302, 3: 8296}     # 各级右点线制表位
+TOC_L1_LEFT_TAB = 1050                          # 仅"带编号"的一级条目才有
+TOC_IND_LEFT = {1: 0, 2: 420, 3: 840}
+TOC_NAME_RE = re.compile(r'^toc\s*([123])$', re.I)
+TOC_L1_NUM_RE = re.compile(r'^第\s*\d+\s*章')
 
 
 class Report:
@@ -162,6 +200,9 @@ def build_styles(z):
         bo = st.find(W + 'basedOn')
         if bo is not None:
             d['_basedOn'] = bo.get(W + 'val')
+        nm = st.find(W + 'name')
+        if nm is not None:
+            d['name'] = nm.get(W + 'val')
         ppr, rpr = st.find(W + 'pPr'), st.find(W + 'rPr')
         if rpr is not None:
             sz = rpr.find(W + 'sz')
@@ -174,6 +215,9 @@ def build_styles(z):
             if rf is not None:
                 d['eastAsia'] = rf.get(W + 'eastAsia') or rf.get(W + 'eastAsiaTheme') or ''
         if ppr is not None:
+            ol = ppr.find(W + 'outlineLvl')
+            if ol is not None:
+                d['outlineLvl'] = ival(ol)
             jc = ppr.find(W + 'jc')
             if jc is not None:
                 d['jc'] = jc.get(W + 'val')
@@ -186,13 +230,27 @@ def build_styles(z):
             ind = ppr.find(W + 'ind')
             if ind is not None:
                 d['ind'] = {k.split('}')[-1]: v for k, v in ind.attrib.items()}
+            tabs = ppr.find(W + 'tabs')
+            if tabs is not None:
+                d['tabs'] = [{k.split('}')[-1]: v for k, v in t.attrib.items()}
+                             for t in tabs]
             if ppr.find(W + 'keepNext') is not None:
                 d['keepNext'] = True
-            if ppr.find(W + 'numPr') is not None:
-                d['numPr'] = True
-            pb = ppr.find(W + 'pBdr')
+            pb = ppr.find(W + 'pageBreakBefore')
             if pb is not None:
-                bo2 = pb.find(W + 'bottom')
+                d['pbb'] = pb.get(W + 'val') not in ('0', 'false')
+            npr = ppr.find(W + 'numPr')
+            if npr is not None:
+                d['numPr'] = True
+                il = npr.find(W + 'ilvl')
+                if il is not None:
+                    d['numPrIlvl'] = ival(il)
+                nl = npr.find(W + 'numId')
+                if nl is not None:
+                    d['numPrId'] = nl.get(W + 'val')
+            pbd = ppr.find(W + 'pBdr')
+            if pbd is not None:
+                bo2 = pbd.find(W + 'bottom')
                 if bo2 is not None:
                     d['pBdrBottom'] = ival(bo2, 'sz')
         raw[sid] = d
@@ -222,18 +280,62 @@ def para_style_d(p, styles, default_id):
     return styles.get(pstyle(p) or default_id, {})
 
 
+def para_rpr(p):
+    """段落级 w:pPr/w:rPr —— 段落标记的字体字号。
+
+    这一层极易漏读：模板里"参考文献"标题的 18pt 就写在 pPr/rPr，
+    run 上一个 w:sz 都没有。只读 run 会误判成样式里的 12pt。
+    """
+    pPr = pr(p)
+    return pPr.find(W + 'rPr') if pPr is not None else None
+
+
 def run_sizes(p, sd, default_sz):
-    """段落中各可见 run 的有效字号集合（只返回能确定的整数）。"""
+    """段落中各可见 run 的有效字号集合（只返回能确定的整数）。
+
+    优先级：run rPr > 段落 pPr/rPr > 样式（含 basedOn）> 文档默认。
+    """
+    prpr = para_rpr(p)
+    p_sz = ival(prpr.find(W + 'sz')) if prpr is not None else None
+    if p_sz is None:
+        p_sz = sd.get('sz', default_sz)
     out = set()
     for r in p.findall(W + 'r'):
         if not ''.join(t.text or '' for t in r.iter(W + 't')):
             continue
         rpr = r.find(W + 'rPr')
         sz = ival(rpr.find(W + 'sz')) if rpr is not None else None
-        if sz is None:
-            sz = sd.get('sz', default_sz)
-        if sz is not None:
-            out.add(sz)
+        out.add(sz if sz is not None else p_sz)
+    return {s for s in out if s is not None}
+
+
+def run_fonts(p, sd):
+    """各可见 run 的有效中文字体集合（主题字体名视为"未显式指定"而丢弃）。
+
+    优先级：run rPr > 段落 pPr/rPr > 样式。
+    """
+    style_font = sd.get('eastAsia')
+    if style_font in THEME_FONTS:
+        style_font = None
+    prpr = para_rpr(p)
+    p_font = None
+    if prpr is not None:
+        rf = prpr.find(W + 'rFonts')
+        if rf is not None:
+            p_font = rf.get(W + 'eastAsia')
+    out = set()
+    for r in p.findall(W + 'r'):
+        if not ''.join(t.text or '' for t in r.iter(W + 't')):
+            continue
+        f = None
+        rpr = r.find(W + 'rPr')
+        if rpr is not None:
+            rf = rpr.find(W + 'rFonts')
+            if rf is not None:
+                f = rf.get(W + 'eastAsia')
+        f = f or p_font or style_font
+        if f:
+            out.add(f)
     return out
 
 
@@ -281,6 +383,123 @@ def eff_keepnext(p, sd):
     if pPr is not None and pPr.find(W + 'keepNext') is not None:
         return True
     return bool(sd.get('keepNext'))
+
+
+def eff_pbb(p, sd):
+    """段前分页。段落直接设置优先于样式，w:val=0/false 表示显式关闭。"""
+    pPr = pr(p)
+    if pPr is not None:
+        el = pPr.find(W + 'pageBreakBefore')
+        if el is not None:
+            return el.get(W + 'val') not in ('0', 'false')
+    return bool(sd.get('pbb'))
+
+
+def eff_tabs(p, sd):
+    """有效制表位 = 样式制表位 + 段落制表位，段落同位置覆盖样式，val=clear 删除。
+
+    Word 里段落 w:tabs 是"合并"而不是"替换"：想干掉样式里的制表位，
+    必须写 <w:tab w:val="clear" w:pos="..."/>，光写一个新的不够。
+    """
+    base = [dict(t) for t in (sd.get('tabs') or [])]
+    pPr = pr(p)
+    if pPr is not None:
+        tabs = pPr.find(W + 'tabs')
+        if tabs is not None:
+            for t in tabs:
+                d = {k.split('}')[-1]: v for k, v in t.attrib.items()}
+                pos = d.get('pos')
+                base = [b for b in base if b.get('pos') != pos]
+                if d.get('val') != 'clear':
+                    base.append(d)
+    return base
+
+
+def tab_at(tabs, pos, val, leader=None):
+    for t in tabs:
+        if to_int(t.get('pos')) == pos and t.get('val') == val:
+            if leader is None or t.get('leader') == leader:
+                return True
+    return False
+
+
+def heading_level(p, styles):
+    """按 outlineLvl 判标题层级 —— 唯一跨模板稳定的判据。"""
+    d = styles.get(pstyle(p) or '')
+    lvl = d.get('outlineLvl') if d else None
+    return lvl if lvl in HEADING_LEVELS else None
+
+
+def heading_num_id(p, sd):
+    """标题的有效 numId：段落 numPr 优先，否则取样式。0 表示显式关闭编号。"""
+    pPr = pr(p)
+    if pPr is not None:
+        npr = pPr.find(W + 'numPr')
+        if npr is not None:
+            el = npr.find(W + 'numId')
+            if el is not None:
+                return to_int(el.get(W + 'val'))
+    return to_int(sd.get('numPrId'))
+
+
+def heading_ind_ok(ind, spec):
+    """标题用"悬挂缩进"给编号让位：左缩进 = 悬挂量 = N 字符宽。
+
+    N 字符的绝对缇值随字号变化（16pt→640、14pt→1120、12pt→960），
+    模板里取的是 643 / 1124 / 964，都带几缇的取整余量，故用容差比对。
+    """
+    left = to_int(ind.get('left'))
+    if left is None:
+        return False
+    if abs(left - spec['ind_left']) > TOL_IND:
+        return False
+    hang = to_int(ind.get('hanging'))
+    if hang is not None and abs(hang - spec['ind_hanging']) > TOL_IND:
+        return False
+    hc = to_int(ind.get('hangingChars'))
+    if hc is not None and hc != spec['hanging_chars']:
+        return False
+    return True
+
+
+def toc_level(p, styles):
+    """目录条目层级：靠样式名 toc 1/2/3 判，样式 ID 不可靠。"""
+    nm = (styles.get(pstyle(p) or '') or {}).get('name') or ''
+    m = TOC_NAME_RE.match(nm.strip())
+    return int(m.group(1)) if m else None
+
+
+def build_numbering(z):
+    """解析 numbering.xml -> ({abstractNumId: {ilvl: 属性}}, {numId: abstractNumId})。"""
+    abstracts, num_map = {}, {}
+    if 'word/numbering.xml' not in z.namelist():
+        return abstracts, num_map
+    root = ET.fromstring(z.read('word/numbering.xml'))
+    for an in root.iter(W + 'abstractNum'):
+        lv = {}
+        for l in an.findall(W + 'lvl'):
+            i = to_int(l.get(W + 'ilvl'))
+            if i is None:
+                continue
+            rpr = l.find(W + 'rPr')
+            rf = rpr.find(W + 'rFonts') if rpr is not None else None
+            sz = rpr.find(W + 'sz') if rpr is not None else None
+            lt = l.find(W + 'lvlText')
+            ind = l.find(W + 'ind')
+            lv[i] = {
+                'text': lt.get(W + 'val') if lt is not None else None,
+                'ind': {k.split('}')[-1]: v for k, v in ind.attrib.items()}
+                       if ind is not None else {},
+                'hint': rf.get(W + 'hint') if rf is not None else None,
+                'eastAsia': rf.get(W + 'eastAsia') if rf is not None else None,
+                'sz': ival(sz),
+            }
+        abstracts[an.get(W + 'abstractNumId')] = lv
+    for nm_ in root.iter(W + 'num'):
+        a = nm_.find(W + 'abstractNumId')
+        if a is not None:
+            num_map[nm_.get(W + 'numId')] = a.get(W + 'val')
+    return abstracts, num_map
 
 
 def to_int(v):
@@ -344,9 +563,18 @@ def check(path):
 
     doc = ET.fromstring(z.read('word/document.xml'))
     styles, default_id, default_sz = build_styles(z)
+    abstracts, num_map = build_numbering(z)
     body = doc.find(W + 'body')
     blocks = body_blocks(body)
     direct_ps = [el for el in blocks if el.tag == W + 'p']
+
+    # 样式一律按内置名反查，不按 styleId（后者由 Word 按模板和语言环境分配）
+    sid_by_name = {}
+    for sid, d in styles.items():
+        nm = (d.get('name') or '').strip().lower()
+        if nm and nm not in sid_by_name:
+            sid_by_name[nm] = sid
+    caption_sid = sid_by_name.get(CAPTION_STYLE_NAME)
 
     # 封面区 = 第一个"承载分节符"的段落及其之前的所有段落。
     # 封面用的是 62pt 大标题 + 16pt 表格文字，绝不能拿去比对正文格式。
@@ -505,8 +733,9 @@ def check(path):
     for p in direct_ps:
         if id(p) in cover_ids:          # 封面：62pt 大标题、16pt 表格文字，不按正文算
             continue
-        s = pstyle(p)
-        if s in HEADING_STYLES or s == CAPTION_STYLE:
+        if heading_level(p, styles) is not None:
+            continue
+        if caption_sid is not None and pstyle(p) == caption_sid:
             continue
         if len(ptext(p).strip()) < MIN_BODY_LEN:
             continue
@@ -553,31 +782,274 @@ def check(path):
                    '此处为完全无缩进的段落）' % (len(bad_ind), len(para_ps)))
 
     # ------------------------------------------------ 标题
-    found = {s: 0 for s in HEADING_STYLES}
-    numpr = 0
-    for p in direct_ps:
-        s = pstyle(p)
-        if s in HEADING_STYLES:
-            found[s] += 1
-            pPr = pr(p)
-            if pPr is not None and pPr.find(W + 'numPr') is not None:
-                numpr += 1
-            elif styles.get(s, {}).get('numPr'):
-                numpr += 1
-    total_h = sum(found.values())
-    if total_h:
-        r.ok('标题', '使用内置标题 1/2/3 样式',
-             ' / '.join('%s=%d' % (v, found[k]) for k, v in HEADING_STYLES.items()))
-        if numpr == total_h:
-            r.ok('标题', '标题挂接多级列表自动编号', '%d 处' % numpr)
-        else:
-            r.fail('标题', '标题挂接多级列表自动编号',
-                   '仅 %d/%d 处带 numPr' % (numpr, total_h))
+    # 分两层查：
+    #   ① 样式契约（styles.xml 里定义得对不对）
+    #   ② 实际排版（排版后生效的值对不对）
+    # 两者经常不是一回事——本模板 heading 1 定义 sz=24，实际排成 16pt；
+    # heading 2 定义 sz=32，实际 14pt。只查定义会对着错误数字判 PASS。
+    h_sid = {lvl: sid_by_name.get('heading %d' % (lvl + 1)) for lvl in HEADING_LEVELS}
+    missing_h = [HEADING_NAMES[l] for l in HEADING_LEVELS if not h_sid[l]]
+
+    if missing_h:
+        r.fail('标题', '内置标题 1/2/3 样式存在',
+               'styles.xml 缺少 %s；标题必须套内置样式，'
+               '手搓"加粗+大字号"无法生成目录与自动编号' % '、'.join(missing_h))
     else:
-        r.warn('标题', '使用内置标题 1/2/3 样式', '未检出标题段落')
+        r.ok('标题', '内置标题 1/2/3 样式存在',
+             'styleId：' + ' / '.join('%s=%s' % (HEADING_NAMES[l], h_sid[l])
+                                      for l in HEADING_LEVELS))
+
+        bad_ol = ['%s(styleId=%s) 实测 %s'
+                  % (HEADING_NAMES[l], h_sid[l], styles[h_sid[l]].get('outlineLvl'))
+                  for l in HEADING_LEVELS
+                  if styles[h_sid[l]].get('outlineLvl') != l]
+        if bad_ol:
+            r.fail('标题', '标题样式 outlineLvl 为 0/1/2',
+                   '；'.join(bad_ol) + '；outlineLvl 决定目录层级，错位会串纲')
+        else:
+            r.ok('标题', '标题样式 outlineLvl 为 0/1/2')
+
+        bad_np = [HEADING_NAMES[l] for l in HEADING_LEVELS
+                  if not to_int(styles[h_sid[l]].get('numPrId'))]
+        if bad_np:
+            r.fail('标题', '标题样式挂接多级列表自动编号',
+                   '%s 的 numPr 缺失或 numId=0，标题不会自动编号' % '、'.join(bad_np))
+        else:
+            r.ok('标题', '标题样式挂接多级列表自动编号',
+                 'numId：' + ' / '.join('%s=%s' % (HEADING_NAMES[l],
+                                                  styles[h_sid[l]]['numPrId'])
+                                        for l in HEADING_LEVELS))
+
+        bad_b = [HEADING_NAMES[l] for l in HEADING_LEVELS
+                 if not styles[h_sid[l]].get('b')]
+        if bad_b:
+            r.fail('标题', '标题样式定义加粗', '、'.join(bad_b) + ' 未加粗')
+        else:
+            r.ok('标题', '标题样式定义加粗')
+
+    # ---- 实际排版：逐段核对生效的字号 / 字体 / 对齐 / 分页 / 缩进
+    hd_ps = []
+    for p in direct_ps:
+        lvl = heading_level(p, styles)
+        if lvl is not None:
+            hd_ps.append((lvl, p))
+
+    struct_h, unnum_h, num_h = [], [], []
+    for lvl, p in hd_ps:
+        sd = para_style_d(p, styles, default_id)
+        if p.find(W + 'pPr/' + W + 'sectPr') is not None and not ptext(p).strip():
+            struct_h.append((lvl, p))       # 承载节属性的空标题段落，不是真标题
+        elif heading_num_id(p, sd) == 0:
+            unnum_h.append((lvl, p))
+        else:
+            num_h.append((lvl, p))
+
+    if struct_h:
+        r.ok('标题', '承载末节属性的空标题段落已识别',
+             '%d 处（分节符挂在标题1的 pPr 里，不是漏排的标题）' % len(struct_h))
+
+    if not num_h:
+        r.warn('标题', '标题实际排版', '未检出带编号的标题段落')
+    else:
+        bad = {'sz': [], 'font': [], 'jc': [], 'pbb': [], 'ind': []}
+        for lvl, p in num_h:
+            sd = para_style_d(p, styles, default_id)
+            spec = HEADING_SPEC[lvl]
+
+            szs = run_sizes(p, sd, default_sz)
+            if szs and szs != {spec['sz']}:
+                bad['sz'].append((lvl, p, '%g pt' % (sorted(szs)[0] / 2.0)))
+
+            fs = run_fonts(p, sd)
+            if fs and spec['font'] not in fs:
+                bad['font'].append((lvl, p, '/'.join(sorted(fs))))
+
+            jc = eff_jc(p, sd)
+            if spec['jc'] == 'center':
+                if jc != 'center':
+                    bad['jc'].append((lvl, p, jc or '左对齐'))
+            elif jc == 'center':
+                bad['jc'].append((lvl, p, 'center'))
+
+            pbb = eff_pbb(p, sd)
+            if pbb != spec['pbb']:
+                bad['pbb'].append((lvl, p, '设了段前分页' if pbb else '未设段前分页'))
+
+            ind = eff_ind(p, sd)
+            if not heading_ind_ok(ind, spec):
+                bad['ind'].append((lvl, p, 'left=%s hanging=%s'
+                                   % (ind.get('left') or '-', ind.get('hanging') or '-')))
+
+        def hv(items, name, expect):
+            if not items:
+                r.ok('标题', name, expect)
+                return
+            det = ['%s《%s》%s' % (HEADING_NAMES[l], ptext(p).strip()[:12] or '空', g)
+                   for l, p, g in items[:3]]
+            tail = '' if len(items) <= 3 else ' 等 %d 处' % len(items)
+            r.fail('标题', name, '；'.join(det) + tail + '；应为 ' + expect)
+
+        hv(bad['sz'], '标题字号', '一级 16pt、二级 14pt、三级 12pt')
+        hv(bad['font'], '标题中文字体', '黑体')
+        hv(bad['jc'], '一级标题居中、二三级不居中',
+           '一级 w:jc=center，二三级不得为 center')
+        hv(bad['pbb'], '仅一级标题段前分页',
+           '一级 pageBreakBefore，二三级不设')
+        hv(bad['ind'], '标题悬挂缩进为编号让位',
+           '一级 643/643（2 字符）、二级 1124/1124（4 字符）、三级 964/964（4 字符）')
+
+    if unnum_h:
+        bad_u = []
+        for lvl, p in unnum_h:
+            sd = para_style_d(p, styles, default_id)
+            label = ptext(p).strip()[:12] or '空'
+            szs = run_sizes(p, sd, default_sz)
+            if szs and not szs <= set(UNNUMBERED_HEADING_SZ):
+                bad_u.append('《%s》字号 %g pt' % (label, sorted(szs)[0] / 2.0))
+            if eff_jc(p, sd) != 'center':
+                bad_u.append('《%s》未居中' % label)
+            if not eff_pbb(p, sd):
+                bad_u.append('《%s》未段前分页' % label)
+        if bad_u:
+            r.warn('标题', '无编号一级标题（参考文献等）',
+                   '；'.join(bad_u) + '；应为 16pt 或 18pt、居中、段前分页')
+        else:
+            r.ok('标题', '无编号一级标题（参考文献等）',
+                 '%d 处：numId=0 关闭编号、居中、段前分页' % len(unnum_h))
+
+    # ------------------------------------------------ 多级列表
+    h_num = []
+    for lvl in HEADING_LEVELS:
+        sid = h_sid.get(lvl)
+        if sid and sid in styles:
+            nid = to_int(styles[sid].get('numPrId'))
+            if nid:
+                h_num.append((lvl, nid))
+
+    if not h_num:
+        r.warn('多级列表', '标题编号定义', '标题样式未挂有效 numId，无法检查编号定义')
+    else:
+        uniq = sorted({nid for _, nid in h_num})
+        if len(uniq) != 1:
+            r.warn('多级列表', '三级标题共用同一 numId',
+                   '实测 %s；应为同一个多级列表，否则各级编号会各数各的' % uniq)
+        else:
+            nid = uniq[0]
+            aid = num_map.get(str(nid))
+            if aid is None:
+                r.fail('多级列表', 'numId 指向有效的 abstractNum',
+                       'numId=%d 在 numbering.xml 里没有对应项，标题将不带编号' % nid)
+            else:
+                lv = abstracts.get(aid, {})
+                r.ok('多级列表', 'numId 指向有效的 abstractNum',
+                     'numId=%d -> abstractNumId=%s' % (nid, aid))
+
+                bad_txt = []
+                for ilvl, exp in NUMBERING_EXPECT.items():
+                    got = (lv.get(ilvl) or {}).get('text')
+                    if got != exp:
+                        bad_txt.append('ilvl=%d 实测 %r' % (ilvl, got))
+                if bad_txt:
+                    r.fail('多级列表', '编号格式 第X章 / X.X / X.X.X',
+                           '；'.join(bad_txt) + '；应为 第%1章 / %1.%2 / %1.%2.%3')
+                else:
+                    r.ok('多级列表', '编号格式 第X章 / X.X / X.X.X',
+                         'ilvl 0/1/2 = 第%1章 / %1.%2 / %1.%2.%3')
+
+                bad_hint = [ilvl for ilvl in NUMBERING_EXPECT
+                            if (lv.get(ilvl) or {}).get('hint') != 'eastAsia'
+                            and not (lv.get(ilvl) or {}).get('eastAsia')]
+                if bad_hint:
+                    r.warn('多级列表', '编号数字使用中文字体',
+                           'ilvl %s 的 rPr/rFonts 未标 hint=eastAsia，'
+                           '"第1章"里的数字可能排成西文字形'
+                           % '/'.join(str(i) for i in bad_hint))
+                else:
+                    r.ok('多级列表', '编号数字使用中文字体', 'rFonts hint=eastAsia')
+
+                bad_nind = ['ilvl=%d %s' % (ilvl, (lv.get(ilvl) or {})['ind'])
+                            for ilvl in NUMBERING_EXPECT
+                            if (lv.get(ilvl) or {}).get('ind')]
+                if bad_nind:
+                    r.fail('多级列表', '编号层不设缩进（缩进只由段落控制）',
+                           '；'.join(bad_nind) + '；编号层与段落 ind 会叠加成双倍缩进')
+                else:
+                    r.ok('多级列表', '编号层不设缩进（缩进只由段落控制）')
+
+    # ------------------------------------------------ 目录
+    toc_ps = []
+    for p in doc.iter(W + 'p'):
+        lvl = toc_level(p, styles)
+        if lvl is not None:
+            toc_ps.append((lvl, p))
+
+    real_h = len(num_h) + len(unnum_h)
+    if not toc_ps:
+        r.warn('目录', '目录条目按 toc 1/2/3 样式排版',
+               '未检出 toc 样式条目；目录可能是手打的纯文本，无法自动更新')
+    else:
+        r.ok('目录', '目录条目按 toc 1/2/3 样式排版',
+             '一级 %d / 二级 %d / 三级 %d'
+             % tuple(sum(1 for l, _ in toc_ps if l == i) for i in (1, 2, 3)))
+
+        if len(toc_ps) == real_h:
+            r.ok('目录', '目录条目数与正文标题数一致', '各 %d 条' % real_h)
+        else:
+            r.warn('目录', '目录条目数与正文标题数一致',
+                   '目录 %d 条 / 正文标题 %d 条；目录多半是更新前的旧快照，'
+                   '按 F9 更新域后再交付' % (len(toc_ps), real_h))
+
+        bad_tsz, bad_ttab, bad_tind, bad_tline = [], [], [], []
+        for lvl, p in toc_ps:
+            sd = para_style_d(p, styles, default_id)
+            label = ptext(p).strip()[:12] or '空'
+
+            szs = run_sizes(p, sd, default_sz)
+            if szs and szs != {TOC_ENTRY_SZ}:
+                bad_tsz.append((lvl, p, '%g pt' % (sorted(szs)[0] / 2.0)))
+
+            tabs = eff_tabs(p, sd)
+            exp_pos = TOC_RIGHT_TAB[lvl]
+            if not tab_at(tabs, exp_pos, 'right', 'dot'):
+                bad_ttab.append((lvl, p, '缺右点线制表位 %d' % exp_pos))
+            elif lvl == 1:
+                # 一级条目里只有"带编号的章"才要左制表位来把编号和章名拉开；
+                # 参考文献这类无编号条目只用右点线，多一个 1050 会让文字错位
+                has_num = bool(TOC_L1_NUM_RE.match(label))
+                has_left = tab_at(tabs, TOC_L1_LEFT_TAB, 'left')
+                if has_num and not has_left:
+                    bad_ttab.append((lvl, p, '带编号的一级条目缺左制表位 %d'
+                                     % TOC_L1_LEFT_TAB))
+                if not has_num and has_left:
+                    bad_ttab.append((lvl, p, '无编号的一级条目多了左制表位 %d'
+                                     % TOC_L1_LEFT_TAB))
+
+            left = to_int(eff_ind(p, sd).get('left')) or 0
+            if left != TOC_IND_LEFT[lvl]:
+                bad_tind.append((lvl, p, 'left=%d' % left))
+
+            if eff_line(p, sd) != (LINE_1_5, 'auto'):
+                bad_tline.append((lvl, p, 'line=%s' % (eff_line(p, sd)[0],)))
+
+        def tv(items, name, expect):
+            if not items:
+                r.ok('目录', name, expect)
+                return
+            det = ['%d 级《%s》%s' % (l, ptext(p).strip()[:12] or '空', g)
+                   for l, p, g in items[:3]]
+            tail = '' if len(items) <= 3 else ' 等 %d 处' % len(items)
+            r.fail('目录', name, '；'.join(det) + tail + '；应为 ' + expect)
+
+        tv(bad_tsz, '目录条目字号', '小四 12pt（sz=24）')
+        tv(bad_ttab, '目录条目制表位',
+           '一级 1050 左制表位 + 8302 右点线；无编号一级仅 8302 右点线；'
+           '二级 8302 右点线；三级 8296 右点线')
+        tv(bad_tind, '目录条目缩进', '一级 0、二级 420（2 字符）、三级 840（4 字符）')
+        tv(bad_tline, '目录条目行距', '1.5 倍（line=360 lineRule=auto）')
 
     # ------------------------------------------------ 题注
-    caps = [p for p in direct_ps if pstyle(p) == CAPTION_STYLE and is_caption(p)]
+    caps = [p for p in direct_ps
+            if caption_sid is not None and pstyle(p) == caption_sid and is_caption(p)]
     if not caps:
         r.warn('题注', '题注格式统一', '未检出带 SEQ 域的题注段落')
     else:
@@ -677,7 +1149,7 @@ def check(path):
     if 'TOC' in doc_instr:
         r.ok('表格与域', '目录由 TOC 域自动生成')
     else:
-        r.fail('表格与域', '目录由 TOC 域自动生成', '未找到 TOC 域，目录可能是手打的')
+        r.fail('表格与域', '目录由 TOC 域自动生成', 'document.xml 中无 TOC 域')
     for seq, label in (('SEQ 图', '图'), ('SEQ 表', '表')):
         if seq in doc_instr:
             r.ok('表格与域', '%s题注使用自动编号域' % label)

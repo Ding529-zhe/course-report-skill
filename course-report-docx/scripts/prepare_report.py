@@ -18,8 +18,14 @@
     6. 统一题注格式：图/表/算法题注一律居中、加粗、不缩进；
        表与算法题注设"与下段同页"，图题注不设
     7. 给紧邻图题注的图片段落补上"与下段同页"
-    8. 给无样式的正文段落补齐小四 12pt（模板的 Normal 样式是五号，
+    8. 给缺缩进/缩进不对的标题补上规范悬挂缩进（模板里个别标题漏了这项）
+    9. 给无样式的正文段落补齐小四 12pt（模板的 Normal 样式是五号，
        不补的话直接打字会得到五号字）
+
+开工前还有一道前置校验：源文件的标题样式必须与检查器（check_report.py）
+的断言基准一致——那边的字号 16/14/12pt、缩进 643/1124/964 都是按原课程
+报告模板标定的。换一份模板时这些数字不再成立，脚本会直接停下并提示，
+而不会拿错的标准去判你的文档。确认要用新模板时带 --force 跳过。
 
 它**不会**做的事（必须人工完成，因为没有可靠的判定依据）：
     - 删除示例插图、示例表格、定义/定理示例、算法示例框
@@ -47,6 +53,14 @@ PH_DATE = '{{DATE}}'
 HDR_PLACEHOLDER = 'XXXXXXX课程报告'
 CAPTION_SEQS = {'SEQ 图': '图', 'SEQ 表': '表', 'SEQ 代码': '算法'}
 MIN_BODY_LEN = 20
+
+# 标题悬挂缩进：左缩进 = 悬挂量 = N 字符宽，给自动编号腾位
+# (left, hanging, hangingChars)；N 字符的绝对缇值随字号变，故三个都写死
+HEADING_IND = {0: (643, 643, 200), 1: (1124, 1124, 400), 2: (964, 964, 400)}
+
+# 断言基准模板的 heading styleId -> outlineLvl。
+# check_report.py 里的字号/缩进断言值是按这份模板标定的，换模板就得重标。
+TEMPLATE_HEADING_IDS = {'2': 0, '3': 1, '4': 2}
 
 # CT_PPr / CT_RPr 的子元素顺序（ECMA-376），插错位置 Word 会报"内容有问题"
 PPR_ORDER = ['pStyle', 'keepNext', 'keepLines', 'pageBreakBefore', 'framePr',
@@ -229,6 +243,80 @@ def has_figure(p):
             or p.find('.//' + q('txbxContent')) is not None)
 
 
+# ---------------------------------------------------------------- 样式索引与前置校验
+def load_style_index(z):
+    """读 styles.xml -> ({内置名: styleId}, {styleId: outlineLvl}, {styleId: numId})。
+
+    一律按 w:name（内置名，不随界面语言变）定位样式；styleId 是 Word
+    按模板和环境自己分配的，同一份规范在别的机器上可能是 1/2/3 或 Heading1。
+    """
+    by_name, outline, num_ids = {}, {}, {}
+    if 'word/styles.xml' not in z.namelist():
+        return by_name, outline, num_ids
+    root = ET.fromstring(z.read('word/styles.xml'))
+    for st in root.iter(q('style')):
+        if st.get(W + 'type') not in (None, 'paragraph'):
+            continue
+        sid = st.get(W + 'styleId')
+        nm = st.find(q('name'))
+        if nm is not None:
+            key = (nm.get(W + 'val') or '').strip().lower()
+            if key and key not in by_name:
+                by_name[key] = sid
+        ppr = st.find(q('pPr'))
+        if ppr is None:
+            continue
+        ol = ppr.find(q('outlineLvl'))
+        if ol is not None:
+            try:
+                outline[sid] = int(ol.get(W + 'val'))
+            except (TypeError, ValueError):
+                pass
+        npr = ppr.find(q('numPr'))
+        if npr is not None:
+            e = npr.find(q('numId'))
+            if e is not None:
+                num_ids[sid] = e.get(W + 'val')
+    return by_name, outline, num_ids
+
+
+def assert_heading_contract(by_name, outline, force=False):
+    """前置校验：标题样式必须与检查器的断言基准一致。
+
+    check_report.py 里的字号（16/14/12pt）、缩进（643/1124/964）都是按
+    这份模板标定的。若换成别的学校模板，或别人机器上重存过，styleId 与
+    字号体系都可能不同——此时断言会全线误报，比不检查更糟。所以先在这里拦住。
+    """
+    got = {}
+    for name in ('heading 1', 'heading 2', 'heading 3'):
+        sid = by_name.get(name)
+        if sid:
+            got[sid] = outline.get(sid)
+
+    if got == TEMPLATE_HEADING_IDS:
+        return
+
+    miss = [n for n in ('heading 1', 'heading 2', 'heading 3') if not by_name.get(n)]
+    lines = []
+    if miss:
+        lines.append('缺少内置标题样式：%s' % '、'.join(miss))
+    if got and got != TEMPLATE_HEADING_IDS:
+        lines.append('实测 styleId->outlineLvl = %s，基准为 %s'
+                     % (got, TEMPLATE_HEADING_IDS))
+    detail = '；'.join(lines)
+
+    if force:
+        print('[警告] 标题样式与断言基准不一致：%s' % detail)
+        print('       字号/缩进断言可能误报，已按 --force 继续。')
+        return
+    print('[终止] 标题样式与检查器的断言基准不一致：%s' % detail)
+    print('       check_report.py 的字号（16/14/12pt）与缩进（643/1124/964）')
+    print('       都是按原课程报告模板标定的；换模板后这些数字不再成立。')
+    print('       若确认要用这份模板，请先在 check_report.py 里重标')
+    print('       HEADING_SPEC / HEADING_IND，再带 --force 重跑。')
+    sys.exit(1)
+
+
 # ---------------------------------------------------------------- 各个处理步骤
 def is_last_para_in_cell(p, pm):
     """p 是否是所在单元格 / 文本框里唯一剩下的段落。
@@ -387,14 +475,14 @@ def fill_placeholders(root, title, date, stats):
             stats['date_replaced'] += replace_across_runs(p, PH_DATE, date)
 
 
-def unify_captions(root, stats):
+def unify_captions(root, stats, caption_sid=None):
     """图/表/算法题注统一：居中、加粗、不缩进；keepNext 按类型设置。"""
     for p in root.iter(q('p')):
         pPr = p.find(q('pPr'))
         if pPr is None:
             continue
         st = pPr.find(q('pStyle'))
-        if st is None or st.get(W + 'val') != '5':
+        if st is None or st.get(W + 'val') != caption_sid:
             continue
         kind = caption_kind(p)
         if kind is None:
@@ -434,6 +522,56 @@ def fix_image_keepnext(root, stats):
             if pPr.find(q('keepNext')) is None:
                 set_child(pPr, q('keepNext'), {}, PPR_ORDER)
                 stats['img_keepnext'] += 1
+
+
+def fix_heading_indent(root, outline, num_ids, stats):
+    """给缺缩进 / 缩进不对的标题段落补上规范悬挂缩进。
+
+    标题的编号位置靠悬挂缩进腾出来：左缩进 = 悬挂量，编号占住悬挂区。
+    模板里个别标题（示例中的"数学方面"）漏了这段设置，照抄会让编号顶到页边。
+    只改 pPr/ind，不动字号字体，也不碰承载分节符的空标题段落。
+    """
+    for p in root.iter(q('p')):
+        pPr = p.find(q('pPr'))
+        if pPr is None:
+            continue
+        st = pPr.find(q('pStyle'))
+        if st is None:
+            continue
+        sid = st.get(W + 'val')
+        lvl = outline.get(sid)
+        if lvl not in HEADING_IND:
+            continue
+        if pPr.find(q('sectPr')) is not None:
+            continue                      # 承载分节符的空标题，结构段落
+        # numId=0 表示显式关闭编号（参考文献等），这类标题不需要悬挂缩进
+        npr = pPr.find(q('numPr'))
+        para_num = None
+        if npr is not None:
+            e = npr.find(q('numId'))
+            if e is not None:
+                para_num = e.get(W + 'val')
+        if (para_num or num_ids.get(sid) or '') == '0':
+            continue
+
+        left, hang, hc = HEADING_IND[lvl]
+        want = {'left': str(left), 'hanging': str(hang), 'hangingChars': str(hc)}
+        ind = pPr.find(q('ind'))
+        if ind is not None:
+            cur = {k.split('}')[-1]: v for k, v in ind.attrib.items()}
+            if all(cur.get(k) == v for k, v in want.items()):
+                continue
+        else:
+            ind = set_child(pPr, q('ind'), want, PPR_ORDER)
+            stats['heading_ind_fixed'] += 1
+            continue
+
+        for k, v in want.items():
+            ind.set(W + k, v)
+        # firstLine 与 hanging 互斥；leftChars 会覆盖 left，都必须清掉
+        for a in ('leftChars', 'firstLine', 'firstLineChars'):
+            ind.attrib.pop(W + a, None)
+        stats['heading_ind_fixed'] += 1
 
 
 def fill_body_font(root, stats):
@@ -499,17 +637,23 @@ def fix_content_types(raw, part_names):
 
 
 # ---------------------------------------------------------------- 主流程
-def prepare(src, dst, course, title=None, date=None, keep_samples=False, verbose=True):
+def prepare(src, dst, course, title=None, date=None, keep_samples=False,
+            verbose=True, force=False):
     names = []
     stats = {'red_runs': 0, 'empty_paras': 0, 'rev_removed': 0, 'rev_unwrapped': 0,
              'header_replaced': 0, 'title_replaced': 0, 'date_replaced': 0,
-             'captions_fixed': 0, 'img_keepnext': 0,
+             'captions_fixed': 0, 'img_keepnext': 0, 'heading_ind_fixed': 0,
              'font_filled': 0, 'parts_dropped': 0, 'rels_removed': 0,
              'comment_marks': 0}
 
     with zipfile.ZipFile(src) as z:
         names = z.namelist()
         replace, drop = {}, set()
+
+        # 先确认这份模板就是检查器断言基准的那一份，否则后面全是瞎判
+        by_name, outline, num_ids = load_style_index(z)
+        assert_heading_contract(by_name, outline, force=force)
+        caption_sid = by_name.get('caption')
 
         # --- document.xml ---
         raw = z.read('word/document.xml')
@@ -519,8 +663,9 @@ def prepare(src, dst, course, title=None, date=None, keep_samples=False, verbose
         if not keep_samples:              # 批注部件要删时，正文锚点必须一起清
             strip_comment_markers(doc, stats)
         fill_placeholders(doc, title, date, stats)
-        unify_captions(doc, stats)
+        unify_captions(doc, stats, caption_sid)
         fix_image_keepnext(doc, stats)
+        fix_heading_indent(doc, outline, num_ids, stats)
         fill_body_font(doc, stats)
         replace['word/document.xml'] = serialize(doc, raw)
 
@@ -570,6 +715,7 @@ def prepare(src, dst, course, title=None, date=None, keep_samples=False, verbose
         print('  封面日期替换              : %d' % stats['date_replaced'])
         print('  题注格式统一              : %d 处' % stats['captions_fixed'])
         print('  图片段落补"与下段同页"    : %d 处' % stats['img_keepnext'])
+        print('  标题补悬挂缩进            : %d 处' % stats['heading_ind_fixed'])
         print('  正文 run 补小四字号       : %d' % stats['font_filled'])
         print('  删除批注等部件            : %d 个' % stats['parts_dropped'])
 
@@ -607,7 +753,8 @@ def main():
 
     args = list(sys.argv[1:])
     keep_samples = '--keepsamples' in args
-    args = [a for a in args if a != '--keepsamples']
+    force = '--force' in args
+    args = [a for a in args if a not in ('--keepsamples', '--force')]
 
     course = take_opt(args, '--course', HDR_PLACEHOLDER)
     title = take_opt(args, '--title')
@@ -617,7 +764,7 @@ def main():
         print(__doc__)
         sys.exit(2)
     prepare(args[0], args[1], course, title=title, date=date,
-            keep_samples=keep_samples)
+            keep_samples=keep_samples, force=force)
 
 
 if __name__ == '__main__':
