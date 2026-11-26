@@ -19,6 +19,7 @@
 import sys
 import os
 import re
+import struct
 import zipfile
 import xml.etree.ElementTree as ET
 
@@ -82,6 +83,44 @@ TOC_L1_LEFT_TAB = 1050                          # 仅"带编号"的一级条目�
 TOC_IND_LEFT = {1: 0, 2: 420, 3: 840}
 TOC_NAME_RE = re.compile(r'^toc\s*([123])$', re.I)
 TOC_L1_NUM_RE = re.compile(r'^第\s*\d+\s*章')
+
+# ---------------------------------------------------------------- 元数据与工具残留
+META_WATERMARK_RE = re.compile(
+    r'(模板生成|python-docx|pandoc|typora|chatgpt|claude|deepseek|kimi|gemini|ai\s*生成|lab-report)',
+    re.I,
+)
+PNG_TOOL_RE = re.compile(
+    r'(matplotlib|graphviz|mermaid|pillow|python|dall-e|midjourney)',
+    re.I,
+)
+INVISIBLE_CHARS = {
+    '\u200b': 'U+200B',
+    '\u200c': 'U+200C',
+    '\u200d': 'U+200D',
+    '\ufeff': 'U+FEFF',
+    '\u202f': 'U+202F',
+    '\u2060': 'U+2060',
+}
+PROMPT_LEAK_RE = re.compile(r'(【写作提示】|【待补】|\[(?:FIX|EXT|REF)(?:-\d+)?\]|\bTODO\b)')
+MD_SYNTAX_RE = re.compile(r'(\*\*[^*\n]{2,40}\*\*|^\s*#{1,4}\s+\S)', re.M)
+
+
+def scan_png_text(data):
+    """提取 PNG 中 tEXt/iTXt/zTXt 块文本，用于检测脚本绘图工具软件标记。"""
+    if not data.startswith(b'\x89PNG\r\n\x1a\n'):
+        return []
+    hits = []
+    pos = 8
+    while pos + 8 <= len(data):
+        length = struct.unpack('>I', data[pos:pos + 4])[0]
+        ctype = data[pos + 4:pos + 8].decode('ascii', 'replace')
+        payload = data[pos + 8:pos + 8 + length]
+        if ctype in ('tEXt', 'iTXt'):
+            hits.append(payload.decode('utf-8', 'replace').replace('\x00', ': '))
+        elif ctype == 'zTXt':
+            hits.append(payload[:80].decode('latin1', 'replace'))
+        pos += 12 + length
+    return hits
 
 
 class Report:
@@ -1224,6 +1263,68 @@ def check(path):
         r.fail('残留清理', '没有修订痕迹残留', '存在 w:ins / w:del，请接受所有修订')
     else:
         r.ok('残留清理', '没有修订痕迹残留')
+
+    # ------------------------------------------------ 元数据与工具残留
+    meta_hits = []
+    if 'docProps/core.xml' in names:
+        try:
+            core = ET.fromstring(z.read('docProps/core.xml'))
+            for el in core:
+                tag = el.tag.split('}')[-1]
+                val = (el.text or '').strip()
+                if val and tag in ('description', 'creator', 'lastModifiedBy', 'title', 'subject'):
+                    if META_WATERMARK_RE.search(val):
+                        meta_hits.append('%s=%r' % (tag, val))
+        except ET.ParseError:
+            pass
+    if meta_hits:
+        r.fail('元数据与工具残留', '文档属性不含生成工具水印', '；'.join(meta_hits))
+    else:
+        r.ok('元数据与工具残留', '文档属性不含生成工具水印')
+
+    png_hits = []
+    for nm in names:
+        if nm.startswith('word/media/') and nm.lower().endswith('.png'):
+            for chunk in scan_png_text(z.read(nm)):
+                if PNG_TOOL_RE.search(chunk):
+                    png_hits.append('%s(%s)' % (nm.split('/')[-1], chunk[:48]))
+    if png_hits:
+        r.warn('元数据与工具残留', '插图不含脚本绘图软件元数据',
+               '；'.join(png_hits[:3]) + '（流程图建议改用矢量工具或剥离元数据；数据图可忽略）')
+    else:
+        r.ok('元数据与工具残留', '插图不含脚本绘图软件元数据')
+
+    full_body = '\n'.join(ptext(p) for p in doc.iter(W + 'p'))
+    inv_hits = [code for ch, code in INVISIBLE_CHARS.items() if ch in full_body]
+    if inv_hits:
+        r.fail('元数据与工具残留', '正文不含零宽/隐形 Unicode 水印字符', '检出 ' + ', '.join(inv_hits))
+    else:
+        r.ok('元数据与工具残留', '正文不含零宽/隐形 Unicode 水印字符')
+
+    leak_hits = sorted(set(PROMPT_LEAK_RE.findall(full_body)))
+    md_hits = MD_SYNTAX_RE.findall(full_body)
+    if any(x in leak_hits for x in ('【写作提示】', '【待补】')):
+        r.fail('元数据与工具残留', '正文不含写作提示/工程标签或 Markdown 残留',
+               '检出 ' + ', '.join(leak_hits))
+    elif leak_hits or md_hits:
+        det = []
+        if leak_hits:
+            det.append('标签 ' + ', '.join(leak_hits[:4]))
+        if md_hits:
+            det.append('疑似 Markdown 语法 %d 处' % len(md_hits))
+        r.warn('元数据与工具残留', '正文不含写作提示/工程标签或 Markdown 残留', '；'.join(det))
+    else:
+        r.ok('元数据与工具残留', '正文不含写作提示/工程标签或 Markdown 残留')
+
+    spaced = len(re.findall(r'[\u4e00-\u9fff] [A-Za-z0-9]|[A-Za-z0-9] [\u4e00-\u9fff]', full_body))
+    tight = len(re.findall(r'[\u4e00-\u9fff][A-Za-z0-9]|[A-Za-z0-9][\u4e00-\u9fff]', full_body))
+    total_mix = spaced + tight
+    if total_mix >= 30 and (spaced / total_mix) >= 0.75:
+        r.warn('元数据与工具残留', '中英文/数字间距自然（无机械盘古之白）',
+               '加空格占比 %.0f%%（%d/%d），建议检查是否像 Markdown 直接转换'
+               % (100.0 * spaced / total_mix, spaced, total_mix))
+    else:
+        r.ok('元数据与工具残留', '中英文/数字间距自然（无机械盘古之白）')
 
     return r
 
